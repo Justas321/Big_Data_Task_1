@@ -30,6 +30,9 @@ def is_valid_mmsi_expr(col_name: str):
 def read_csv_in_chunks(file_path, chunk_size: int = 60000):
     temp_output = f"temp_{os.path.basename(file_path)}"
     lf = (pl.scan_csv(file_path).filter(is_valid_mmsi_expr("MMSI")))
+    lf = lf.rename({"# Timestamp": "Timestamp"})
+    lf = lf.with_columns(pl.col("Timestamp").str.to_datetime())
+    lf = lf.sort(["MMSI", "Timestamp"])
     first_chunk = True
     for i, df_chunk in enumerate(lf.collect_batches(chunk_size=chunk_size), start=1):
         with open(temp_output, "a" if not first_chunk else "w", newline="", encoding="utf-8") as f:
