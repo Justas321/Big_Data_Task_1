@@ -1,66 +1,212 @@
-import polars as pl
+import csv
 import time
 import os
-from multiprocessing import Pool
+import hashlib
+from multiprocessing import Process, Queue
 import psutil
 
-# Function fixes MB
-def fix_mb (value):
-    return value/(1024*1024)
+INVALID_MMSI_SET = {
+    "000000000",
+    "111111111",
+    "123456789",
+    "999999999",
+}
 
-# Function to check if column has a valid MMSI - Later used in read_csv_in_chunks file or MMSI column
-def is_valid_mmsi_expr(col_name: str):
-    mmsi = pl.col(col_name).cast(pl.String).str.strip_chars()
-    mid = mmsi.str.slice(0, 3).cast(pl.Int32)
-    
-    return (
-        mmsi.is_not_null() &
-        mmsi.str.contains(r"^\d{9}$") &
-        (mmsi != "000000000") &
-        mid.is_between(201, 775)
+def get_memory_usage_mb(pid=None):
+    if pid is None:
+        pid = os.getpid()
+    process = psutil.Process(pid)
+    return process.memory_info().rss / (1024 * 1024)
+
+def is_valid_mmsi(mmsi: str) -> bool:
+    if mmsi is None:
+        return False
+
+    mmsi = mmsi.strip()
+
+    if len(mmsi) != 9 or not mmsi.isdigit():
+        return False
+
+    if mmsi in INVALID_MMSI_SET:
+        return False
+
+    if len(set(mmsi)) == 1:
+        return False
+
+    mid = int(mmsi[:3])
+    if mid < 201 or mid > 775:
+        return False
+
+    return True
+
+def stable_bucket_id(mmsi: str, num_buckets: int) -> int:
+    digest = hashlib.md5(mmsi.encode("utf-8")).hexdigest()
+    return int(digest, 16) % num_buckets
+
+
+def bucket_worker(bucket_id, task_queue, output_dir):
+    worker_pid = os.getpid()
+    peak_mem_mb = get_memory_usage_mb(worker_pid)
+    total_rows_written = 0
+    chunks_received = 0
+
+    output_path = os.path.join(output_dir, f"bucket_{bucket_id}.csv")
+    header_written = os.path.exists(output_path) and os.path.getsize(output_path) > 0
+
+    while True:
+        chunk = task_queue.get()
+        if chunk is None:
+            break
+
+        if not chunk:
+            continue
+
+        chunks_received += 1
+        peak_mem_mb = max(peak_mem_mb, get_memory_usage_mb(worker_pid))
+
+        with open(output_path, "a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=chunk[0].keys())
+
+            if not header_written:
+                writer.writeheader()
+                header_written = True
+
+            writer.writerows(chunk)
+
+        total_rows_written += len(chunk)
+        peak_mem_mb = max(peak_mem_mb, get_memory_usage_mb(worker_pid))
+
+    print(
+        f"[Worker {bucket_id} | PID {worker_pid}] "
+        f"chunks={chunks_received}, rows={total_rows_written}, "
+        f"peak_rss_mb={peak_mem_mb:.2f}"
     )
 
+def stream_partition_csv_parallel(input_csv, output_dir, num_buckets=4, flush_every=5000):
+    os.makedirs(output_dir, exist_ok=True)
 
-# Function that reads csv in chunks already filtering out invalid MMSI
-# Shortly to describe logic:
-# Firstly scans a file and already filters out not valid MMSI
-# Secondly loops through polars batches (Through 60000 rows at the time)
-# Thirdly it creates temporary csv file and writes there filtered rows
-# Fourthly if it is first chunk it writes in csv, if it is not, it appends ('a', 'w' logic)
-def read_csv_in_chunks(file_path, chunk_size: int = 60000):
-    temp_output = f"temp_{os.path.basename(file_path)}"
-    lf = (pl.scan_csv(file_path).filter(is_valid_mmsi_expr("MMSI")))
-    lf = lf.rename({"# Timestamp": "Timestamp"})
-    lf = lf.with_columns(pl.col("Timestamp").str.to_datetime())
-    lf = lf.sort(["MMSI", "Timestamp"])
-    first_chunk = True
-    for i, df_chunk in enumerate(lf.collect_batches(chunk_size=chunk_size), start=1):
-        with open(temp_output, "a" if not first_chunk else "w", newline="", encoding="utf-8") as f:
-            df_chunk.write_csv(f, include_header=first_chunk)
+    start_time = time.time()
+    main_peak_mem_mb = get_memory_usage_mb()
 
-        print(f"Batch {i}: {df_chunk.height} rows")
-        first_chunk = False
-    return temp_output
+    queues = [Queue(maxsize=8) for _ in range(num_buckets)]
+    workers = []
 
-# Runs code in parallel using cpu_cores / 2 workers
-# It merges two temp files in to one big csv
-def run_code_in_parallel(files, final_output):
-    start = time.perf_counter()
-    workers = os.cpu_count() // 2
-    print(f"Our script will be using {workers} workers")
-    process = psutil.Process()
-    with Pool(processes=workers) as pool:
-        temp_files = pool.map(read_csv_in_chunks, files)
-        mem_rss = process.memory_info().rss
+    for bucket_id in range(num_buckets):
+        p = Process(target=bucket_worker, args=(bucket_id, queues[bucket_id], output_dir))
+        p.start()
+        workers.append(p)
 
-    if temp_files:
-        pl.scan_csv(temp_files).sink_csv(final_output)
+    buffers = [[] for _ in range(num_buckets)]
 
-    duration = time.perf_counter() - start
-    print(f"Total time: {duration:.2f}s",
-           f"Memory RSS {fix_mb(mem_rss):.2f} MB")
+    total_rows_read = 0
+    total_rows_valid = 0
+    total_rows_rejected = 0
+    rejected_bad_mmsi = 0
+    rejected_bad_coords = 0
+    rejected_bad_timestamp = 0
+    bucket_row_counts = [0] * num_buckets
+    bucket_chunk_counts = [0] * num_buckets
+
+    with open(input_csv, "r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+
+        for row in reader:
+            total_rows_read += 1
+
+            if total_rows_read % 200000 == 0:
+                print(f"Processed {total_rows_read} rows...")
+                main_peak_mem_mb = max(main_peak_mem_mb, get_memory_usage_mb())
+
+            mmsi = row.get("MMSI", "").strip()
+            ts = row.get("# Timestamp", "").strip()
+            lat = row.get("Latitude", "").strip()
+            lon = row.get("Longitude", "").strip()
+
+            if not is_valid_mmsi(mmsi):
+                total_rows_rejected += 1
+                rejected_bad_mmsi += 1
+                continue
+
+            if not ts:
+                total_rows_rejected += 1
+                rejected_bad_timestamp += 1
+                continue
+
+            try:
+                lat_val = float(lat)
+                lon_val = float(lon)
+                if not (-90 <= lat_val <= 90 and -180 <= lon_val <= 180):
+                    total_rows_rejected += 1
+                    rejected_bad_coords += 1
+                    continue
+            except Exception:
+                total_rows_rejected += 1
+                rejected_bad_coords += 1
+                continue
+
+            total_rows_valid += 1
+
+            bucket_id = stable_bucket_id(mmsi, num_buckets)
+            buffers[bucket_id].append(row)
+            bucket_row_counts[bucket_id] += 1
+
+            if len(buffers[bucket_id]) >= flush_every:
+                queues[bucket_id].put(buffers[bucket_id])
+                bucket_chunk_counts[bucket_id] += 1
+                buffers[bucket_id] = []
+
+    for bucket_id in range(num_buckets):
+        if buffers[bucket_id]:
+            queues[bucket_id].put(buffers[bucket_id])
+            bucket_chunk_counts[bucket_id] += 1
+
+    for q in queues:
+        q.put(None)
+
+    for p in workers:
+        p.join()
+
+    elapsed = time.time() - start_time
+    main_peak_mem_mb = max(main_peak_mem_mb, get_memory_usage_mb())
+
+    print("\n=== Partitioning Summary ===")
+    print(f"Total rows read:      {total_rows_read}")
+    print(f"Valid rows kept:      {total_rows_valid}")
+    print(f"Rejected rows:        {total_rows_rejected}")
+    print(f"  - bad MMSI:         {rejected_bad_mmsi}")
+    print(f"  - bad timestamp:    {rejected_bad_timestamp}")
+    print(f"  - bad coordinates:  {rejected_bad_coords}")
+    print(f"Elapsed time (sec):   {elapsed:.2f}")
+    print(f"Main peak RSS (MB):   {main_peak_mem_mb:.2f}")
+
+    print("\n=== Bucket Distribution ===")
+    for i in range(num_buckets):
+        print(
+            f"Bucket {i}: rows={bucket_row_counts[i]}, "
+            f"chunks_sent={bucket_chunk_counts[i]}"
+        )
 
 if __name__ == "__main__":
-    files = ["aisdk-2026-02-27.csv", "aisdk-2026-02-28.csv"]
-    output = "filtered_ship_data.csv"
-    run_code_in_parallel(files, output)
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    files = [
+        os.path.join(base_dir, "aisdk-2026-02-27.csv"),
+        os.path.join(base_dir, "aisdk-2026-02-28.csv"),
+    ]
+
+    for file_path in files:
+        file_name = os.path.splitext(os.path.basename(file_path))[0]
+        out_dir = os.path.join(base_dir, "partitions", file_name)
+
+        print("=" * 80)
+        print("Processing:", file_path)
+
+        if not os.path.exists(file_path):
+            print(f"Skipping missing file: {file_path}")
+            continue
+
+        stream_partition_csv_parallel(
+            input_csv=file_path,
+            output_dir=out_dir,
+            num_buckets=8,
+            flush_every=5000,
+        )
