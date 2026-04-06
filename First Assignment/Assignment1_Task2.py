@@ -5,6 +5,11 @@ import hashlib
 from datetime import datetime
 from multiprocessing import Process
 from typing import Optional
+from collections import defaultdict
+from datetime import timedelta
+
+import glob
+import itertools
 
 
 # =========================
@@ -132,7 +137,6 @@ def partition_ais_file(input_csv_path, bucket_dir, num_buckets=8):
         for f in files:
             f.close()
 
-
 # =========================
 # Task 2 - Reduce step
 # Chronological vessel-state tracking inside isolated workers
@@ -158,6 +162,7 @@ def process_bucket(bucket_id, bucket_csv_path, output_csv_path):
             ts_str = row.get("# Timestamp", "").strip()
             lat_str = row.get("Latitude", "").strip()
             lon_str = row.get("Longitude", "").strip()
+            draught = row.get("Draught", "").strip()
 
             if not mmsi:
                 continue
@@ -169,26 +174,34 @@ def process_bucket(bucket_id, bucket_csv_path, output_csv_path):
             try:
                 lat = float(lat_str)
                 lon = float(lon_str)
+                drt = float(draught)
             except ValueError:
                 continue
 
-            vessels.setdefault(mmsi, []).append((ts, lat, lon))
+            vessels.setdefault(mmsi, []).append((ts, lat, lon, drt))
 
-    fieldnames = [
-        "MMSI",
-        "event_index",
-        "timestamp",
-        "latitude",
-        "longitude",
-        "prev_timestamp",
-        "prev_latitude",
-        "prev_longitude",
-        "delta_seconds",
-        "distance_from_prev_nm",
-    ]
+        fieldnames = [
+            "MMSI",
+            "event_index",
+            "timestamp",
+            "latitude",
+            "longitude",
+            "draught",        # ← no trailing space
+            "prev_timestamp",
+            "prev_latitude",
+            "prev_longitude",
+            "prev_draught",   # ← no trailing space
+            "draught_changes",
+            "delta_seconds",
+            "distance_from_prev_nm",
+            "was_dark",
+            "suspicious_draft_change",
+        ]
 
     vessel_count = 0
     output_rows = 0
+    was_dark_rows = 0
+    draft_changes_rows = 0
 
     with open(output_csv_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -203,23 +216,44 @@ def process_bucket(bucket_id, bucket_csv_path, output_csv_path):
             prev_ts = None
             prev_lat = None
             prev_lon = None
-
-            for idx, (ts, lat, lon) in enumerate(points, start=1):
+            prev_drt = None
+            for idx, (ts, lat, lon, drt) in enumerate(points, start=1):
                 if prev_ts is None:
                     delta_seconds = ""
                     distance_nm = ""
                     prev_ts_str = ""
                     prev_lat_out = ""
                     prev_lon_out = ""
+                    prev_drt_out = ""
+                    draught_changes = ""
+                    was_dark = "NO"
+                    suspicious_draft_change = "NO"
                 else:
                     delta_seconds = int((ts - prev_ts).total_seconds())
                     distance_nm = round(
                         km_to_nm(haversine_km(prev_lat, prev_lon, lat, lon)),
                         6
                     )
+                    draught_changes = ((drt - prev_drt) / prev_drt) * 100
                     prev_ts_str = prev_ts.isoformat(sep=" ")
                     prev_lat_out = prev_lat
                     prev_lon_out = prev_lon
+                    prev_drt_out = prev_drt
+                    sog = distance_nm / (delta_seconds / 3600) if delta_seconds > 0 else 0
+                    gap_hours = delta_seconds / 3600
+                    # ANOMALY A Detection
+                    if gap_hours > 4:
+                        was_dark = "YES"
+                        was_dark_rows += 1
+                    else:
+                        was_dark = "NO"
+
+                    # ANOMALY C Detection
+                    if gap_hours >= 2 and abs(draught_changes) >= 5:
+                       suspicious_draft_change = "YES"
+                       draft_changes_rows += 1
+                    else:
+                       suspicious_draft_change = "NO"
 
                 writer.writerow({
                     "MMSI": mmsi,
@@ -227,21 +261,27 @@ def process_bucket(bucket_id, bucket_csv_path, output_csv_path):
                     "timestamp": ts.isoformat(sep=" "),
                     "latitude": lat,
                     "longitude": lon,
+                    "draught": drt,
                     "prev_timestamp": prev_ts_str,
                     "prev_latitude": prev_lat_out,
                     "prev_longitude": prev_lon_out,
+                    "prev_draught": prev_drt_out,
+                    "draught_changes": draught_changes,
                     "delta_seconds": delta_seconds,
                     "distance_from_prev_nm": distance_nm,
+                    "was_dark": was_dark,
+                    "suspicious_draft_change": suspicious_draft_change,
                 })
                 output_rows += 1
 
                 prev_ts = ts
                 prev_lat = lat
                 prev_lon = lon
+                prev_drt = drt
 
-    print(
+        print(
         f"[Worker {bucket_id}] rows_read={rows_read}, "
-        f"vessels={vessel_count}, output_rows={output_rows}"
+        f"vessels={vessel_count}, output_rows={output_rows}, Anomaly_A_detected_in={was_dark_rows}, Anomaly_C_detected_in={draft_changes_rows}"
     )
 
 
@@ -286,11 +326,16 @@ def merge_reduced_outputs(reduced_dir, final_output_csv):
         "timestamp",
         "latitude",
         "longitude",
+        "draught",        # ← no trailing space
         "prev_timestamp",
         "prev_latitude",
         "prev_longitude",
+        "prev_draught",   # ← no trailing space
+        "draught_changes",
         "delta_seconds",
         "distance_from_prev_nm",
+        "was_dark",
+        "suspicious_draft_change",
     ]
 
     total_rows = 0
@@ -308,40 +353,9 @@ def merge_reduced_outputs(reduced_dir, final_output_csv):
 
     print(f"[Merge] Wrote {total_rows} chronological AIS rows to {final_output_csv}")
 
-
 # =========================
 # End-to-end runner
 # =========================
-
-def process_ais_dataset(input_csv_path, work_root, num_buckets=8):
-    dataset_name = os.path.splitext(os.path.basename(input_csv_path))[0]
-
-    bucket_dir = os.path.join(work_root, "partitions", dataset_name)
-    reduced_dir = os.path.join(work_root, "reduced", dataset_name)
-    final_output_csv = os.path.join(work_root, "reduced", f"{dataset_name}_chronological.csv")
-
-    print("=" * 80)
-    print(f"Processing dataset: {input_csv_path}")
-
-    # Map step
-    partition_ais_file(
-        input_csv_path=input_csv_path,
-        bucket_dir=bucket_dir,
-        num_buckets=num_buckets,
-    )
-
-    # Reduce step
-    run_parallel_reduce(
-        bucket_dir=bucket_dir,
-        reduced_dir=reduced_dir,
-        num_buckets=num_buckets,
-    )
-
-    # Merge step
-    merge_reduced_outputs(
-        reduced_dir=reduced_dir,
-        final_output_csv=final_output_csv,
-    )
 
 if __name__ == "__main__":
     base_dir = os.path.dirname(os.path.abspath(__file__))
