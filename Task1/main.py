@@ -1,47 +1,14 @@
 import csv
 import time
 import os
-import hashlib
 from multiprocessing import Process, Queue
-import psutil
 
-INVALID_MMSI_SET = {
-    "000000000",
-    "111111111",
-    "123456789",
-    "999999999",
-}
-
-def get_memory_usage_mb(pid=None):
-    if pid is None:
-        pid = os.getpid()
-    process = psutil.Process(pid)
-    return process.memory_info().rss / (1024 * 1024)
-
-def is_valid_mmsi(mmsi: str) -> bool:
-    if mmsi is None:
-        return False
-
-    mmsi = mmsi.strip()
-
-    if len(mmsi) != 9 or not mmsi.isdigit():
-        return False
-
-    if mmsi in INVALID_MMSI_SET:
-        return False
-
-    if len(set(mmsi)) == 1:
-        return False
-
-    mid = int(mmsi[:3])
-    if mid < 201 or mid > 775:
-        return False
-
-    return True
-
-def stable_bucket_id(mmsi: str, num_buckets: int) -> int:
-    digest = hashlib.md5(mmsi.encode("utf-8")).hexdigest()
-    return int(digest, 16) % num_buckets
+from Task1.utils import (
+    get_memory_usage_mb,
+    is_valid_mmsi,
+    stable_bucket_id,
+    has_valid_coordinates,
+)
 
 
 def bucket_worker(bucket_id, task_queue, output_dir):
@@ -55,6 +22,7 @@ def bucket_worker(bucket_id, task_queue, output_dir):
 
     while True:
         chunk = task_queue.get()
+
         if chunk is None:
             break
 
@@ -82,6 +50,7 @@ def bucket_worker(bucket_id, task_queue, output_dir):
         f"peak_rss_mb={peak_mem_mb:.2f}"
     )
 
+
 def stream_partition_csv_parallel(input_csv, output_dir, num_buckets=4, flush_every=5000):
     os.makedirs(output_dir, exist_ok=True)
 
@@ -92,9 +61,12 @@ def stream_partition_csv_parallel(input_csv, output_dir, num_buckets=4, flush_ev
     workers = []
 
     for bucket_id in range(num_buckets):
-        p = Process(target=bucket_worker, args=(bucket_id, queues[bucket_id], output_dir))
-        p.start()
-        workers.append(p)
+        process = Process(
+            target=bucket_worker,
+            args=(bucket_id, queues[bucket_id], output_dir)
+        )
+        process.start()
+        workers.append(process)
 
     buffers = [[] for _ in range(num_buckets)]
 
@@ -118,28 +90,21 @@ def stream_partition_csv_parallel(input_csv, output_dir, num_buckets=4, flush_ev
                 main_peak_mem_mb = max(main_peak_mem_mb, get_memory_usage_mb())
 
             mmsi = row.get("MMSI", "").strip()
-            ts = row.get("# Timestamp", "").strip()
-            lat = row.get("Latitude", "").strip()
-            lon = row.get("Longitude", "").strip()
+            timestamp = row.get("# Timestamp", "").strip()
+            latitude = row.get("Latitude", "").strip()
+            longitude = row.get("Longitude", "").strip()
 
             if not is_valid_mmsi(mmsi):
                 total_rows_rejected += 1
                 rejected_bad_mmsi += 1
                 continue
 
-            if not ts:
+            if not timestamp:
                 total_rows_rejected += 1
                 rejected_bad_timestamp += 1
                 continue
 
-            try:
-                lat_val = float(lat)
-                lon_val = float(lon)
-                if not (-90 <= lat_val <= 90 and -180 <= lon_val <= 180):
-                    total_rows_rejected += 1
-                    rejected_bad_coords += 1
-                    continue
-            except Exception:
+            if not has_valid_coordinates(latitude, longitude):
                 total_rows_rejected += 1
                 rejected_bad_coords += 1
                 continue
@@ -160,53 +125,77 @@ def stream_partition_csv_parallel(input_csv, output_dir, num_buckets=4, flush_ev
             queues[bucket_id].put(buffers[bucket_id])
             bucket_chunk_counts[bucket_id] += 1
 
-    for q in queues:
-        q.put(None)
+    for queue in queues:
+        queue.put(None)
 
-    for p in workers:
-        p.join()
+    for process in workers:
+        process.join()
+
+    failed_workers = [p for p in workers if p.exitcode != 0]
+    if failed_workers:
+        failed_info = ", ".join(
+            f"PID {p.pid} exitcode={p.exitcode}" for p in failed_workers
+        )
+        raise RuntimeError(f"Worker(s) failed: {failed_info}")
 
     elapsed = time.time() - start_time
     main_peak_mem_mb = max(main_peak_mem_mb, get_memory_usage_mb())
 
-    print("\n=== Partitioning Summary ===")
-    print(f"Total rows read:      {total_rows_read}")
-    print(f"Valid rows kept:      {total_rows_valid}")
-    print(f"Rejected rows:        {total_rows_rejected}")
-    print(f"  - bad MMSI:         {rejected_bad_mmsi}")
-    print(f"  - bad timestamp:    {rejected_bad_timestamp}")
-    print(f"  - bad coordinates:  {rejected_bad_coords}")
-    print(f"Elapsed time (sec):   {elapsed:.2f}")
-    print(f"Main peak RSS (MB):   {main_peak_mem_mb:.2f}")
+    print("\nPartitioning Summary:")
+    print(f"Total rows read: {total_rows_read}")
+    print(f"Valid rows kept: {total_rows_valid}")
+    print(f"Total rows rejected: {total_rows_rejected}")
+    print(f"  for bad MMSI: {rejected_bad_mmsi}")
+    print(f"  for bad timestamp: {rejected_bad_timestamp}")
+    print(f"  for bad coordinates: {rejected_bad_coords}")
+    print(f"Elapsed time (sec): {elapsed:.2f}")
+    print(f"Main peak RSS (MB): {main_peak_mem_mb:.2f}")
 
-    print("\n=== Bucket Distribution ===")
-    for i in range(num_buckets):
+    print("\nBucket Distribution:")
+    for bucket_id in range(num_buckets):
         print(
-            f"Bucket {i}: rows={bucket_row_counts[i]}, "
-            f"chunks_sent={bucket_chunk_counts[i]}"
+            f"Bucket {bucket_id}: rows={bucket_row_counts[bucket_id]}, "
+            f"chunks_sent={bucket_chunk_counts[bucket_id]}"
         )
 
+
+def find_csv_files(input_dir):
+    if not os.path.isdir(input_dir):
+        return []
+
+    csv_files = []
+    for name in os.listdir(input_dir):
+        full_path = os.path.join(input_dir, name)
+        if os.path.isfile(full_path) and name.lower().endswith(".csv"):
+            csv_files.append(full_path)
+
+    return sorted(csv_files)
+
+
 if __name__ == "__main__":
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    files = [
-        os.path.join(base_dir, "aisdk-2026-02-27.csv"),
-        os.path.join(base_dir, "aisdk-2026-02-28.csv"),
-    ]
+    task_dir = os.path.dirname(os.path.abspath(__file__))
+    project_root = os.path.dirname(task_dir)
+
+    input_dir = os.path.join(project_root, "data")
+    output_base_dir = os.path.join(task_dir, "output")
+
+    os.makedirs(output_base_dir, exist_ok=True)
+
+    files = find_csv_files(input_dir)
+
+    if not files:
+        print(f"No CSV files found in input directory: {input_dir}")
 
     for file_path in files:
         file_name = os.path.splitext(os.path.basename(file_path))[0]
-        out_dir = os.path.join(base_dir, "partitions", file_name)
+        output_dir = os.path.join(output_base_dir, file_name)
 
-        print("=" * 80)
         print("Processing:", file_path)
-
-        if not os.path.exists(file_path):
-            print(f"Skipping missing file: {file_path}")
-            continue
+        print("Output to: ", output_dir)
 
         stream_partition_csv_parallel(
             input_csv=file_path,
-            output_dir=out_dir,
+            output_dir=output_dir,
             num_buckets=8,
             flush_every=5000,
         )
