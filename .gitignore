@@ -215,3 +215,6 @@ Task1/output/*
 
 Task2/output/*
 !Task2/output/.gitkeep
+
+Task3/output/*
+!Task3/output/.gitkeep
