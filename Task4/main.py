@@ -1,10 +1,11 @@
 import time
 import matplotlib.pyplot as plt
-from memory_profiler import profile
 import os
 import csv
 
-from Assignment1_Task1 import  stream_partition_csv_parallel, is_valid_mmsi, get_memory_usage_mb
+from Task1.main import stream_partition_csv_parallel, find_csv_files
+from Task1.utils import is_valid_mmsi, get_memory_usage_mb
+from Task2.main import process_bucket, run_parallel_reduce, find_dataset_dirs
 
 # ---------------------------------------------------------
 # Part 0: Memory profiling should be done: firtly install necessesary libraries
@@ -18,7 +19,7 @@ from Assignment1_Task1 import  stream_partition_csv_parallel, is_valid_mmsi, get
 # ---------------------------------------------------------
 def stream_partition_sequential(input_csv, output_dir):
     os.makedirs(output_dir, exist_ok=True)
-    output_csv = os.path.join(output_dir, "cleaned_data_sequential.csv")
+    output_csv = os.path.join(output_dir, "bucket_0.csv")
     main_peak_mem_mb = get_memory_usage_mb()
     total_rows_read = 0
     total_rows_valid = 0
@@ -78,7 +79,16 @@ def stream_partition_sequential(input_csv, output_dir):
     print(f"  - bad MMSI:         {rejected_bad_mmsi}")
     print(f"  - bad timestamp:    {rejected_bad_timestamp}")
     print(f"  - bad coordinates:  {rejected_bad_coords}")
-    print(f"Main peak RSS (MB):   {main_peak_mem_mb:.2f}")    
+    print(f"Main peak RSS (MB):   {main_peak_mem_mb:.2f}")
+
+
+
+def run_sequential_reduce(task1_bucket_dir, reduced_dir, num_buckets=8):
+
+    for bucket_id in range(num_buckets):
+        bucket_csv_path = os.path.join(task1_bucket_dir, f"bucket_{bucket_id}.csv")
+        output_csv_path = os.path.join(reduced_dir, f"reduced_bucket_{bucket_id}.csv")
+        process_bucket(bucket_id, bucket_csv_path, output_csv_path)    
 
 
 
@@ -87,16 +97,38 @@ def stream_partition_sequential(input_csv, output_dir):
 # ---------------------------------------------------------
 def analyze_speedup():
     print("--- Starting Speedup Analysis ---")
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    files = [
-        os.path.join(base_dir, "aisdk-2026-02-27.csv"),
-        os.path.join(base_dir, "aisdk-2026-02-28.csv"),
-    ]
+
+    task_dir = os.path.dirname(os.path.abspath(__file__))
+    project_root = os.path.dirname(task_dir)
+
+    input_dir = os.path.join(project_root, "data")
+    output_base_dir = os.path.join(task_dir, "output")
+    task1_output_dir = os.path.join(project_root, "Task4", "output")
+    reduced_seq_root = os.path.join(output_base_dir, "reduced", "sequential_partitions")
+    reduced_par_root = os.path.join(output_base_dir, "reduced", "parallel_partitions")
+
+    os.makedirs(output_base_dir, exist_ok=True)
+    os.makedirs(reduced_seq_root, exist_ok=True)
+    os.makedirs(reduced_par_root, exist_ok=True)
+
+    num_buckets = 8
+    dataset_dirs = find_dataset_dirs(task1_output_dir)
+    if not dataset_dirs:
+        print(f"No output directories found in: {task1_output_dir}")
+        raise SystemExit(1)
+
+    files = find_csv_files(input_dir)
+    if not files:
+        print(f"No CSV files found in input directory: {input_dir}")
+
     
+    # --- Sequential Analysis ---
+    print("--- Starting Sequential Analysis ---")
     start_seq = time.perf_counter()
+
     for file_path in files:
         file_name = os.path.splitext(os.path.basename(file_path))[0]
-        seq_out_dir = os.path.join(base_dir, "sequential_partitions", file_name)
+        reduced_seq_dir_for_file = os.path.join(reduced_seq_root, file_name)
 
         print("=" * 80)
         print("Processing:", file_path)
@@ -104,22 +136,38 @@ def analyze_speedup():
         if not os.path.exists(file_path):
             print(f"Skipping missing file: {file_path}")
             continue
-    # Measure Sequential Time
-        print("--- Starting Sequential Analysis ---")
+
         stream_partition_sequential(
-                input_csv=file_path,
-                output_dir=seq_out_dir,
+            input_csv=file_path,
+            output_dir=reduced_seq_dir_for_file,
+        )
+
+        for dataset_dir in dataset_dirs:
+            dataset_name = os.path.basename(dataset_dir)
+            reduced_dir = os.path.join(reduced_seq_root, file_name)
+            bucket_source_dir = os.path.join(task1_output_dir, dataset_name, "sequential_partitions", file_name)
+
+            os.makedirs(reduced_dir, exist_ok=True)
+
+            print(f"Processing bucket set: {dataset_name}", flush=True)
+            print(f"Input buckets: {bucket_source_dir}", flush=True)
+            print(f"Reduced output: {reduced_dir}", flush=True)
+
+            run_sequential_reduce(
+                task1_bucket_dir=bucket_source_dir,
+                reduced_dir=reduced_dir,
+                num_buckets=num_buckets,
             )
-    
+
     t_seq = time.perf_counter() - start_seq
     print(f"Sequential Time: {t_seq:.4f} seconds")
-    
-    
-    # Measure Parallel Time    
+
+    # Measure Parallel Time 
+    print("--- Starting Parallel Analysis ---")    
     start_par = time.perf_counter()
     for file_path in files:
         file_name = os.path.splitext(os.path.basename(file_path))[0]
-        par_out_dir = os.path.join(base_dir, "parralel_partitions", file_name)
+        reduced_par_dir_for_file = os.path.join(reduced_par_root, file_name)
 
         print("=" * 80)
         print("Processing:", file_path)
@@ -127,13 +175,30 @@ def analyze_speedup():
         if not os.path.exists(file_path):
             print(f"Skipping missing file: {file_path}")
             continue
-        print("--- Starting Parallel Analysis ---")
+        
         stream_partition_csv_parallel(
-                    input_csv=file_path,
-                    output_dir=par_out_dir,
-                    num_buckets=8,
-                    flush_every=5000,
-                )
+            input_csv=file_path,
+            output_dir=reduced_par_dir_for_file,
+            num_buckets=num_buckets,
+            flush_every=5000,
+        )
+
+        for dataset_dir in dataset_dirs:
+            dataset_name = os.path.basename(dataset_dir)
+            reduced_dir = os.path.join(reduced_par_root, file_name)
+            bucket_source_dir = os.path.join(task1_output_dir, dataset_name, "parallel_partitions", file_name)
+
+            os.makedirs(reduced_dir, exist_ok=True)
+
+            print(f"Processing bucket set: {dataset_name}", flush=True)
+            print(f"Input buckets: {bucket_source_dir}", flush=True)
+            print(f"Reduced output: {reduced_dir}", flush=True)
+
+            run_parallel_reduce(
+                task1_bucket_dir=bucket_source_dir,
+                reduced_dir=reduced_dir,
+                num_buckets=num_buckets,
+            )
     
     t_par = time.perf_counter() - start_par
     print(f"Parallel Time: {t_par:.4f} seconds")
@@ -149,11 +214,14 @@ def optimize_chunks():
     print("--- Starting Chunk Optimization ---")
     chunk_sizes = [5000, 10000, 50000, 100000, 250000, 500000]
     execution_times = []
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    files = [
-        os.path.join(base_dir, "aisdk-2026-02-27.csv"),
-        os.path.join(base_dir, "aisdk-2026-02-28.csv"),
-    ]
+    task_dir = os.path.dirname(os.path.abspath(__file__))
+    project_root = os.path.dirname(task_dir)
+    input_dir = os.path.join(project_root, "data")
+    output_base_dir = os.path.join(task_dir, "output")
+    files = find_csv_files(input_dir)
+
+    if not files:
+        print(f"No CSV files found in input directory: {input_dir}")
 
     for size in chunk_sizes:
         print(f"Testing chunk size: {size}")
@@ -161,7 +229,7 @@ def optimize_chunks():
         
         for file_path in files:
             file_name = os.path.splitext(os.path.basename(file_path))[0]
-            out_dir = os.path.join(base_dir, f"{size}_partitions", file_name)
+            out_dir = os.path.join(output_base_dir, f"{size}_partitions", file_name)
 
             print("=" * 80)
             print("Processing:", file_path)
@@ -175,6 +243,12 @@ def optimize_chunks():
                 output_dir=out_dir,
                 num_buckets=8,
                 flush_every=size,
+            )
+
+            run_parallel_reduce(
+                task1_bucket_dir=out_dir,
+                reduced_dir=out_dir,
+                num_buckets=8,
             )
         
         elapsed = time.perf_counter() - start_time
